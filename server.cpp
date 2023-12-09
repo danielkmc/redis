@@ -19,6 +19,7 @@
 #include "zset.hpp"
 #include "list.hpp"
 #include "heap.hpp"
+#include "thread_pool.hpp"
 #include "common.hpp"
 
 
@@ -66,6 +67,8 @@ static struct {
     DList idle_list;
     // timers for TTLs
     std::vector<HeapItem> heap;
+    // thread pool
+    ThreadPool tp;
 } g_data;
 
 const size_t k_max_msg = 4096;
@@ -347,15 +350,36 @@ static void do_ttl(std::vector<std::string> &cmd, std::string &out) {
     return out_int(out, expire_at > now_us ? (expire_at - now_us) / 1000 : 0);
 }
 
-static void entry_del(Entry *ent) {
+static void entry_destroy(Entry *ent) {
     switch (ent->type) {
     case T_ZSET:
         zset_dispose(ent->zset);
         delete ent->zset;
         break;
     }
-    entry_set_ttl(ent, -1);
     delete ent;
+}
+
+static void entry_del_async(void *arg) {
+    entry_destroy((Entry *)arg);
+}
+
+static void entry_del(Entry *ent) {
+    entry_set_ttl(ent, -1);
+
+    const size_t k_large_container_size = 10000;
+    bool too_big = false;
+    switch(ent->type) {
+    case T_ZSET:
+        too_big = hm_size(&ent->zset->hmap) > k_large_container_size;
+        break;
+    }
+
+    if (too_big) {
+        thread_pool_queue(&g_data.tp, &entry_del_async, ent);
+    } else {
+        entry_destroy(ent);
+    }
 }
 
 static void do_del(std::vector<std::string> &cmd, std::string &out) {
@@ -573,6 +597,10 @@ static void do_request(std::vector<std::string> &cmd, std::string &out) {
         do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd_is(cmd[0], "del")) {
         do_del(cmd, out);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "pexpire")) {
+        do_expire(cmd, out);
+    } else if (cmd.size() == 2 && cmd_is(cmd[0], "pttl")) {
+        do_ttl(cmd, out);
     } else if (cmd.size() == 4 && cmd_is(cmd[0], "zadd")) {
         do_zadd(cmd, out);
     } else if (cmd.size() == 3 && cmd_is(cmd[0], "zrem")) {
@@ -818,9 +846,7 @@ static void process_timers() {
 }
 
 int main() {
-    // Initialize structures
-    dlist_init(&g_data.idle_list);
-
+    // prepare the listening socket
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         die("socket()");
@@ -847,6 +873,10 @@ int main() {
 
     // set the listen fd to nonblocking mode
     fd_set_nb(fd);
+
+    // Initialize timers and thread pool
+    dlist_init(&g_data.idle_list);
+    thread_pool_init(&g_data.tp, 4);
 
     // the event loop
     std::vector<struct pollfd> poll_args;

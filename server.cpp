@@ -8,14 +8,16 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
-#include <vector>
 #include <string>
+#include <vector>
 // proj
 #include "hashtable.hpp"
 #include "zset.hpp"
+#include "list.hpp"
 #include "common.hpp"
 
 
@@ -27,6 +29,12 @@ static void die(const char *msg) {
     int err = errno;
     fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
+}
+
+static uint64_t get_monotonic_usec() {
+    timespec tv = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &tv);
+    return uint64_t(tv.tv_sec) * 1000000 + tv.tv_nsec / 1000;
 }
 
 static void fd_set_nb(int fd) {
@@ -46,6 +54,17 @@ static void fd_set_nb(int fd) {
     }
 }
 
+struct Conn;
+
+// The data structure for the key space.
+static struct {
+    HMap db;
+    // a map of all client connections, keyed by fd
+    std::vector<Conn *> fd2conn;
+    // timer for idle connections
+    DList idle_list;
+} g_data;
+
 const size_t k_max_msg = 4096;
 
 enum {
@@ -64,6 +83,9 @@ struct Conn {
     size_t wbuf_size = 0;
     size_t wbuf_sent = 0;
     uint8_t wbuf[4 + k_max_msg];
+    uint64_t idle_start = 0;
+    // timer
+    DList idle_list;
 };
 
 static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
@@ -73,7 +95,9 @@ static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
     fd2conn[conn->fd] = conn;
 }
 
-static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
+// Returns 0 on successful acceptance of new connection and creation of Conn
+// struct, otherwise -1. 
+static int32_t accept_new_conn(int fd) {
     // accept
     struct sockaddr_in client_addr = {};
     socklen_t socklen = sizeof(client_addr);
@@ -96,7 +120,8 @@ static int32_t accept_new_conn(std::vector<Conn *> &fd2conn, int fd) {
     conn->rbuf_size = 0;
     conn->wbuf_size = 0;
     conn->wbuf_sent = 0;
-    conn_put(fd2conn, conn);
+    conn->idle_start = get_monotonic_usec();
+    conn_put(g_data.fd2conn, conn);
     return 0;
 }
 
@@ -136,11 +161,6 @@ static int32_t parse_req(
     }
     return 0;
 }
-
-// The data structure for the key space.
-static struct {
-    HMap db;
-} g_data;
 
 enum {
     T_STR = 0,
@@ -323,6 +343,8 @@ static void do_zadd(std::vector<std::string> &cmd, std::string &out) {
     HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
 
     Entry *ent = NULL;
+    // If there's no HNode associated with cmd[1] key, create a new Entry and
+    // insert it into g_data using ent->node.
     if (!hnode) {
         ent = new Entry();
         ent->key.swap(key.key);
@@ -336,13 +358,14 @@ static void do_zadd(std::vector<std::string> &cmd, std::string &out) {
             return out_err(out, ERR_TYPE, "expect zset");
         }
     }
-
+    // Each node in the hashmap is associated with a zset. 
     // add or update the tuple
     const std::string &name = cmd[3];
     bool added = zset_add(ent->zset, name.data(), name.size(), score);
     return out_int(out, (int64_t)added);
 }
 
+// Finds `zset` associated with the hcode `s` made in `g_data.db`
 static bool expect_zset(std::string &out, std::string &s, Entry **ent) {
     Entry key;
     key.key.swap(s);
@@ -386,6 +409,13 @@ static void do_zscore(std::vector<std::string> &cmd, std::string &out) {
     return znode ? out_dbl(out, znode->score) : out_nil(out);
 }
 
+// Performs zquery based on the `cmd` parameters [1, 5].
+// Parameters in `cmd`:
+// cmd[1] = zquery
+// cmd[2] = score
+// cmd[3] = name
+// cmd[4] = offset 
+// cmd[5] = limit (limits output to ceil(limit/2) nodes)
 static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
     // parse args
     double score = 0;
@@ -432,6 +462,33 @@ static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
     return out_update_arr(out, n);
 }
 
+static void do_zrank(std::vector<std::string> &cmd, std::string &out) {
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;
+    }
+    const std::string &name = cmd[2];
+    int64_t rank = zset_zrank(ent->zset, name.data(), name.size());
+    return out_int(out, rank);
+}
+
+static void do_zrange(std::vector<std::string> &cmd, std::string &out) {
+    Entry *ent = NULL;
+    if (!expect_zset(out, cmd[1], &ent)) {
+        return;
+    }
+    int64_t low = 0;
+    int64_t high = 0;
+    if (!str2int(cmd[2], low)) {
+        return out_err(out, ERR_ARG, "expect int");
+    }
+    if (!str2int(cmd[3], high)) {
+        return out_err(out, ERR_ARG, "expect int");
+    }
+    int64_t count = zset_zcount(ent->zset, low, high);
+    return out_int(out, count);
+}
+
 static bool cmd_is(const std::string &word, const char *cmd) {
     return 0 == strcasecmp(word.c_str(), cmd);
 }
@@ -453,6 +510,10 @@ static void do_request(std::vector<std::string> &cmd, std::string &out) {
         do_zscore(cmd, out);
     } else if (cmd.size() == 6 && cmd_is(cmd[0], "zquery")) {
         do_zquery(cmd, out);
+    } else if (cmd.size() == 3 && cmd_is(cmd[0], "zrank")) {
+        do_zrank(cmd, out);
+    } else if (cmd.size() == 4 && cmd_is(cmd[0], "zrange")) {
+        do_zrange(cmd, out);
     } else {
         out_err(out, ERR_UNKNOWN, "Unknown cmd");
     }
@@ -587,7 +648,16 @@ static void state_res(Conn *conn) {
     while (try_flush_buffer(conn)) {}
 }
 
+// Begins IO request/response handling. Sets `conn->idle_start` to the current
+// time and moves timer entry to the end of the list to order by oldest to
+// newest `idle_start` 
 static void connection_io(Conn *conn) {
+    // waked up by poll, update the idle timer
+    // by moving conn to the end of the list.
+    conn->idle_start = get_monotonic_usec();
+    dlist_detach(&conn->idle_list);
+    dlist_insert_before(&g_data.idle_list, &conn->idle_list);
+
     if (conn->state == STATE_REQ) {
         state_req(conn);
     } else if (conn->state == STATE_RES) {
@@ -597,7 +667,54 @@ static void connection_io(Conn *conn) {
     }
 }
 
+const uint64_t k_idle_timeout_ms = 5 * 1000;
+
+// Returns ms timeout value for poll based on the next timer value within the 
+// timer list. If the next timer value is more than 5 seconds in the past than
+// the current time, then we return 0.
+// Takes the oldest timer + 5 seconds - current time (usec).
+static uint32_t next_timer_ms() {
+    if (dlist_empty(&g_data.idle_list)) {
+        return 10000;
+    }
+
+    uint64_t now_us = get_monotonic_usec();
+    // refers to the first entry in g_data.idle_list
+    Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+    uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
+    if (next_us <= now_us) {
+        return 0;
+    }
+
+    return (uint32_t)((next_us - now_us) / 1000);
+}
+
+// Closes connection, removes conn from timer list, and frees resources. 
+static void conn_done(Conn *conn) {
+    g_data.fd2conn[conn->fd] = NULL;
+    (void)close(conn->fd);
+    dlist_detach(&conn->idle_list);
+    free(conn);
+}
+
+static void process_timers() {
+    uint64_t now_us = get_monotonic_usec();
+    while (!dlist_empty(&g_data.idle_list)) {
+        Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
+        uint64_t next_us = next->idle_start + k_idle_timeout_ms * 1000;
+        if (next_us >= now_us + 1000) {
+            break;
+        }
+
+        printf("removing idle connection %d\n", next->fd);
+        conn_done(next);
+    }
+}
+
 int main() {
+    // Initialize structures
+    dlist_init(&g_data.idle_list);
+
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         die("socket()");
@@ -622,9 +739,6 @@ int main() {
         die("listen()");
     }
 
-    // a map of all client connections, keyed by fd
-    std::vector<Conn *> fd2conn;
-
     // set the listen fd to nonblocking mode
     fd_set_nb(fd);
 
@@ -637,7 +751,7 @@ int main() {
         struct pollfd pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
         // connection fds
-        for (Conn *conn: fd2conn) {
+        for (Conn *conn: g_data.fd2conn) {
             if (!conn) {
                 continue;
             }
@@ -649,8 +763,8 @@ int main() {
         }
 
         // poll for active fds
-        // the timeout argument doesn't matter here
-        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
+        int timeout_ms = (int)next_timer_ms();
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
         if (rv < 0) {
             die("poll");
         }
@@ -658,21 +772,22 @@ int main() {
         // process active connections
         for (size_t i = 1; i < poll_args.size(); ++i) {
             if (poll_args[i].revents) {
-                Conn *conn = fd2conn[poll_args[i].fd];
+                Conn *conn = g_data.fd2conn[poll_args[i].fd];
                 connection_io(conn);
                 if (conn->state == STATE_END) {
                     // client closed normally, or something bad happened.
                     // destroy this connection
-                    fd2conn[conn->fd] = NULL;
-                    (void)close(conn->fd);
-                    free(conn);
+                    conn_done(conn);
                 }
             }
         }
 
-        // try to accept a new connection if the listening fd is active
+        // handle timers
+        process_timers();
+
+        // If there were events on the listen fd, accept new connection
         if (poll_args[0].revents) {
-            (void)accept_new_conn(fd2conn, fd);
+            (void)accept_new_conn(fd);
         }
     }
 

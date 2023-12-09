@@ -138,7 +138,8 @@ ZNode *zset_pop(ZSet *zset, const char *name, size_t len) {
     return node;
 }
 
-// Returns the ZNode with AVLNode rank equal to `offset`.
+// Returns the ZNode with AVLNode rank `offset` away from the node matching, or
+// the next highest, (score, name) tuple. 
 ZNode *zset_query(
     ZSet *zset, double score, const char *name, size_t len, int64_t offset)
 {
@@ -160,7 +161,15 @@ ZNode *zset_query(
 }
 
 // Returns the rank of `node` in its AVL tree.
-int64_t zrank(AVLNode *node) {
+int64_t zset_zrank(ZSet *zset, const char *name, size_t len) {
+    if (!zset) {
+        return 0;
+    }
+    ZNode *znode = zset_lookup(zset, name, len);
+    if (!znode) {
+        return 0;
+    }
+    AVLNode *node = &znode->tree;
     if (!node) {
         return 0;
     }
@@ -182,7 +191,7 @@ int64_t zrank(AVLNode *node) {
     return rank; 
 }
 
-int64_t zset_count(ZSet *zset, int64_t low, int64_t high) {
+int64_t zset_zcount(ZSet *zset, int64_t low, int64_t high) {
     if (!zset) {
         return -1;
     }
